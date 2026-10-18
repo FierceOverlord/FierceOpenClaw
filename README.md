@@ -27,3 +27,5 @@ bun add --save-dev @types/bun @types/node
 bun add commander @clack/core @clack/prompts figlet
 bun link {name}
 {name} program command
+
+hello world
