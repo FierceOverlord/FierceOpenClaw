@@ -26,7 +26,19 @@ export async function runPlanMode(): Promise<void> {
 
   if (isCancel(goal) || !goal.trim()) return;
 
-  const plan = await generatePlan(goal);
+  let plan;
+
+try {
+  plan = await generatePlan(goal);
+} catch (error) {
+  console.error(chalk.red("\n❌ Plan generation failed."));
+
+  console.error(
+    error instanceof Error ? error.message : error
+  );
+
+  return;
+}
 
   printPlan(plan);
 
@@ -38,27 +50,54 @@ export async function runPlanMode(): Promise<void> {
     initialValue: true,
   });
 
+  if (isCancel(proceed) || !proceed) {
+    console.log(chalk.yellow("\nExecution cancelled.\n"));
+    return;
+  }
+
   const config = defaultAgentConfig();
   const tracker = new ActionTracker();
   const executor = new ToolExecutor(tracker, config);
 
-  const tools = { 
+  const tools = {
     ...createAgentTools(executor),
-    ...createWebTools(tracker)
+    ...createWebTools(tracker),
   };
+
+  let stepFailed = false;
 
   for (const step of selected) {
     console.log(chalk.bold(`\n🔧 ${step.title}\n`));
 
-    const agent = new ToolLoopAgent({
-      model: getAgentModel(),
-      stopWhen: stepCountIs(30),
-      tools,
-    });
+    try {
+      const agent = new ToolLoopAgent({
+        model: getAgentModel(),
+        stopWhen: stepCountIs(30),
+        tools,
+      });
 
-    const r = await agent.generate({ prompt: stepPrompt(plan.goal, step) });
+      const result = await agent.generate({
+        prompt: stepPrompt(plan.goal, step),
+      });
 
-    if (r.text) return console.log(renderTerminalMarkdown(r.text));
+      if (result.text?.trim()) {
+        console.log(renderTerminalMarkdown(result.text));
+      } else {
+        console.log(chalk.dim("No textual response from this step."));
+      }
+    } catch (error) {
+      stepFailed = true;
+      console.error(chalk.red(`Step failed: ${step.title}`), error);
+      break;
+    }
+  }
+
+  if (stepFailed) {
+    console.log(
+      chalk.yellow(
+        "\nExecution stopped because a step failed. Reviewing previously staged changes.\n",
+      ),
+    );
   }
 
   const ok = await runApprovalFlow(tracker);

@@ -1,6 +1,7 @@
 import {
   Output,
   extractJsonMiddleware,
+  NoObjectGeneratedError,
   generateText,
   stepCountIs,
   tool,
@@ -105,41 +106,57 @@ const PLAN_INSTRUCTIONS = (codebase: string, hasWeb: boolean) =>
   ].join("\n");
 
 
-export async function generatePlan(goal:string){
-    const config = defaultAgentConfig();
-    const tracker = new ActionTracker();
-    const executor = new ToolExecutor(tracker, config);
+export async function generatePlan(goal: string) {
+  const config = defaultAgentConfig();
+  const tracker = new ActionTracker();
+  const executor = new ToolExecutor(tracker, config);
 
-    const hasWeb = !!process.env.FIRECRAWL_API_KEY;
-    const model = wrapLanguageModel({
-        model: getAgentModel(),
-        middleware: extractJsonMiddleware(),
-    })
+  const hasWeb = !!process.env.FIRECRAWL_API_KEY;
 
-    // Add web search tool 
-    const tools = {...readOnlyTools(executor), ...(hasWeb ? createWebTools(tracker) : {})};
+  const model = wrapLanguageModel({
+    model: getAgentModel(),
+    middleware: extractJsonMiddleware(),
+  });
 
-    console.log(chalk.cyan("\n🔍 Researching & drafting a plan…\n"));
+  const tools = {
+    ...readOnlyTools(executor),
+    ...(hasWeb ? createWebTools(tracker) : {}),
+  };
 
+  console.log(chalk.cyan("\n🔍 Researching & drafting a plan…\n"));
+
+  try {
     const result = await generateText({
-        model, 
-        tools, 
-        stopWhen: stepCountIs(20),
-        system: PLAN_INSTRUCTIONS(config.codebasePath, false),
-        prompt:`User goal: \n${goal}`,
-        output: Output.object({schema: planSchema})
-    }
-    );
+      model,
+      tools,
+      stopWhen: stepCountIs(20),
+      system: PLAN_INSTRUCTIONS(config.codebasePath, hasWeb),
+      prompt: `User goal:\n${goal}`,
+      output: Output.object({ schema: planSchema }),
+    });
 
     const validated = planSchema.parse(result.output);
-    
-    const steps:PlanStep[] = validated.steps.map((s, i) =>({
-      id: `steps-${i+1}`,
+
+    const steps: PlanStep[] = validated.steps.map((s, i) => ({
+      id: `steps-${i + 1}`,
       title: s.title,
       description: s.description,
       hints: s.hints,
       complexity: s.complexity,
     }));
 
-    return {goal, researchSummary:validated.researchSummary, steps}
+    return {
+      goal,
+      researchSummary: validated.researchSummary,
+      steps,
+    };
+  } catch (error) {
+    if (NoObjectGeneratedError.isInstance(error)) {
+      throw new Error(
+        "The AI model did not return a valid structured plan. Try again or use another model."
+      );
+    }
+
+    throw error;
+  }
 }
