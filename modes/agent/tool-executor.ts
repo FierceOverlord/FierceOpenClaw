@@ -40,13 +40,43 @@ export class ToolExecutor {
   ) {}
 
   private resolveSafe(rel: string): string {
-    const abs = path.resolve(this.config.codebasePath, rel);
-    const root = path.resolve(this.config.codebasePath);
-    const relCheck = path.relative(root, abs);
-    if (relCheck.startsWith("..") || path.isAbsolute(relCheck)) {
+    const root = fs.realpathSync(path.resolve(this.config.codebasePath));
+    const abs = path.resolve(root, rel);
+
+    // Follow symlinks on the deepest ancestor that exists, so a link inside
+    // the workspace cannot point at files outside it.
+    const exists = (p: string) => {
+      try {
+        fs.lstatSync(p);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    let probe = abs;
+    const tail: string[] = [];
+    while (!exists(probe)) {
+      const parent = path.dirname(probe);
+      if (parent === probe) break;
+      tail.unshift(path.basename(probe));
+      probe = parent;
+    }
+    let real: string;
+    try {
+      real = path.join(fs.realpathSync(probe), ...tail);
+    } catch {
+      throw new Error(`Path cannot be resolved safely: ${rel}`);
+    }
+
+    const relCheck = path.relative(root, real);
+    if (
+      relCheck === ".." ||
+      relCheck.startsWith(".." + path.sep) ||
+      path.isAbsolute(relCheck)
+    ) {
       throw new Error(`Path escapes workspace: ${rel}`);
     }
-    return abs;
+    return real;
   }
 
   private excluded(relPath: string): boolean {
@@ -409,14 +439,22 @@ export class ToolExecutor {
     )) {
       const cmd = a.details.command;
       if (!cmd) continue;
+      const safeEnv = Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([k]) => !/(KEY|TOKEN|SECRET|PASSWORD)/i.test(k),
+        ),
+      );
       const r = spawnSync(cmd, {
         shell: true,
         cwd: this.config.codebasePath,
         encoding: "utf8",
         maxBuffer: 16 * 1024 * 1024,
+        timeout: 30_000,
+        env: safeEnv,
       });
-      if (r.status && r.status !== 0)
-        errors.push(`shell exit ${r.status}: ${cmd}`);
+      if (r.error) errors.push(`shell failed (${r.error.message}): ${cmd}`);
+      else if (r.status !== 0)
+        errors.push(`shell exit ${r.status ?? "killed"}: ${cmd}`);
     }
 
     return { errors };

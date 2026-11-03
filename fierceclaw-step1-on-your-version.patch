@@ -1,0 +1,375 @@
+diff --git a/modes/agent/tool-executor.ts b/modes/agent/tool-executor.ts
+index 26ad8df..c79d900 100644
+--- a/modes/agent/tool-executor.ts
++++ b/modes/agent/tool-executor.ts
+@@ -40,13 +40,43 @@ export class ToolExecutor {
+   ) {}
+ 
+   private resolveSafe(rel: string): string {
+-    const abs = path.resolve(this.config.codebasePath, rel);
+-    const root = path.resolve(this.config.codebasePath);
+-    const relCheck = path.relative(root, abs);
+-    if (relCheck.startsWith("..") || path.isAbsolute(relCheck)) {
++    const root = fs.realpathSync(path.resolve(this.config.codebasePath));
++    const abs = path.resolve(root, rel);
++
++    // Follow symlinks on the deepest ancestor that exists, so a link inside
++    // the workspace cannot point at files outside it.
++    const exists = (p: string) => {
++      try {
++        fs.lstatSync(p);
++        return true;
++      } catch {
++        return false;
++      }
++    };
++    let probe = abs;
++    const tail: string[] = [];
++    while (!exists(probe)) {
++      const parent = path.dirname(probe);
++      if (parent === probe) break;
++      tail.unshift(path.basename(probe));
++      probe = parent;
++    }
++    let real: string;
++    try {
++      real = path.join(fs.realpathSync(probe), ...tail);
++    } catch {
++      throw new Error(`Path cannot be resolved safely: ${rel}`);
++    }
++
++    const relCheck = path.relative(root, real);
++    if (
++      relCheck === ".." ||
++      relCheck.startsWith(".." + path.sep) ||
++      path.isAbsolute(relCheck)
++    ) {
+       throw new Error(`Path escapes workspace: ${rel}`);
+     }
+-    return abs;
++    return real;
+   }
+ 
+   private excluded(relPath: string): boolean {
+@@ -409,14 +439,22 @@ export class ToolExecutor {
+     )) {
+       const cmd = a.details.command;
+       if (!cmd) continue;
++      const safeEnv = Object.fromEntries(
++        Object.entries(process.env).filter(
++          ([k]) => !/(KEY|TOKEN|SECRET|PASSWORD)/i.test(k),
++        ),
++      );
+       const r = spawnSync(cmd, {
+         shell: true,
+         cwd: this.config.codebasePath,
+         encoding: "utf8",
+         maxBuffer: 16 * 1024 * 1024,
++        timeout: 30_000,
++        env: safeEnv,
+       });
+-      if (r.status && r.status !== 0)
+-        errors.push(`shell exit ${r.status}: ${cmd}`);
++      if (r.error) errors.push(`shell failed (${r.error.message}): ${cmd}`);
++      else if (r.status !== 0)
++        errors.push(`shell exit ${r.status ?? "killed"}: ${cmd}`);
+     }
+ 
+     return { errors };
+diff --git a/modes/telegram/handlers.ts b/modes/telegram/handlers.ts
+index b84b50b..43f3e4d 100644
+--- a/modes/telegram/handlers.ts
++++ b/modes/telegram/handlers.ts
+@@ -1,7 +1,7 @@
+ import type { Telegraf } from "telegraf";
+ import { isOwner } from "./auth";
+ import { WELCOME } from "./constants";
+-import { clip, commandArg } from "./text";
++import { clip, commandArg, reportError } from "./text";
+ import { runAgent, runAsk, runPlanSteps } from "./agent-run";
+ import { generatePlan } from "../plan/planner";
+ import { planKeyboard, planMessage, planSessions, refreshPlanUi, type PlanSession } from "./plan-session";
+@@ -22,7 +22,7 @@ export function registerHandlers(bot: Telegraf) {
+       });
+ 
+     await ctx.reply("🔍 Researching your question…");
+-    void runAsk(ctx, q).catch(console.error);
++    void runAsk(ctx, q).catch((e) => reportError(ctx, e));
+   });
+ 
+   bot.command("agent", async (ctx) => {
+@@ -33,7 +33,7 @@ export function registerHandlers(bot: Telegraf) {
+         parse_mode: "Markdown",
+       });
+     await ctx.reply("🤖 Agent is working on your task…");
+-    void runAgent(ctx, ctx.chat.id, goal).catch(console.error);
++    void runAgent(ctx, ctx.chat.id, goal).catch((e) => reportError(ctx, e));
+   });
+ 
+   bot.command("plan", async (ctx) => {
+@@ -52,7 +52,7 @@ export function registerHandlers(bot: Telegraf) {
+         const session:PlanSession = {plan , selected:new Set(plan.steps.map((s)=>s.id))}
+         await ctx.reply(planMessage(session) , {parse_mode:"Markdown", ...planKeyboard(session)});
+          planSessions.set(ctx.chat.id, session);
+-    })().catch(console.error)
++    })().catch((e) => reportError(ctx, e))
+   });
+ 
+     bot.action(/^plan_toggle:(.+)$/, async (ctx) => {
+@@ -101,7 +101,7 @@ export function registerHandlers(bot: Telegraf) {
+     await ctx.editMessageText(`🚀 Executing ${steps.length} step(s)…\n\n${list}`);
+     await ctx.answerCbQuery();
+ 
+-    void runPlanSteps(ctx, ctx.chat!.id, plan, steps).catch(console.error);
++    void runPlanSteps(ctx, ctx.chat!.id, plan, steps).catch((e) => reportError(ctx, e));
+   });
+ 
+   bot.action('approval_diff', async (ctx) => {
+@@ -122,9 +122,15 @@ export function registerHandlers(bot: Telegraf) {
+     const { errors } = s.executor.applyApprovedFromTracker();
+     s.executor.clearStaging();
+ 
+-    await ctx.editMessageText('✅ All changes applied.');
+-    await ctx.answerCbQuery('Applied!');
+-    if (errors.length) console.error(errors);
++    if (errors.length) {
++      console.error(errors);
++      await ctx.editMessageText(
++        clip(`⚠️ Applied with ${errors.length} error(s):\n` + errors.join('\n')),
++      );
++    } else {
++      await ctx.editMessageText('✅ All changes applied.');
++    }
++    await ctx.answerCbQuery(errors.length ? 'Finished with errors' : 'Applied!');
+   });
+ 
+   bot.action('approval_reject', async (ctx) => {
+diff --git a/modes/telegram/index.ts b/modes/telegram/index.ts
+index 174d750..4e27f02 100644
+--- a/modes/telegram/index.ts
++++ b/modes/telegram/index.ts
+@@ -1,28 +1,38 @@
+-import { Telegraf } from "telegraf";
+-import chalk from "chalk";
+-import { WELCOME } from "./constants";
+-import { resolve } from "node:dns";
+-import { registerHandlers } from "./handlers";
+-
+-export async function runTelegramMode() {
+-  const token = process.env.TELEGRAM_BOT_TOKEN;
+-  const ownerId = process.env.TELEGRAM_OWNER_ID;
+-
+-  const bot = new Telegraf(token!);
+-  registerHandlers(bot)
+-
+-  await bot.telegram.sendMessage(ownerId!, WELCOME, { parse_mode: "Markdown" });
+-  console.log(chalk.green("Sent welcome message to Telegram.\n"));
+-
+-  bot.launch();
+-  console.log(chalk.green("Telegram bot is running. Press Ctrl+C to stop.\n"));
+-
+-  await new Promise<void>((resolve) => {
+-    const stop = () => {
+-      bot.stop("SIGINT");
+-      resolve();
+-    };
+-    process.once("SIGINT", stop);
+-    process.once("SIGTERM", stop);
+-  });
+-}
+\ No newline at end of file
++import { Telegraf } from "telegraf";
++import chalk from "chalk";
++import { WELCOME } from "./constants";
++import { registerHandlers } from "./handlers";
++
++export async function runTelegramMode() {
++  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
++  const ownerId = process.env.TELEGRAM_OWNER_ID?.trim();
++
++  if (!token || !ownerId) {
++    console.log(
++      chalk.red("TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID must be set in .env\n"),
++    );
++    return;
++  }
++
++  const bot = new Telegraf(token);
++  registerHandlers(bot);
++  bot.catch((err) => console.error(chalk.red("Telegram error:"), err));
++
++  await bot.telegram.sendMessage(ownerId, WELCOME, { parse_mode: "Markdown" });
++  console.log(chalk.green("Sent welcome message to Telegram.\n"));
++
++  bot.launch().catch((err) => {
++    console.error(chalk.red("Bot failed to launch:"), err);
++    process.exit(1);
++  });
++  console.log(chalk.green("Telegram bot is running. Press Ctrl+C to stop.\n"));
++
++  await new Promise<void>((resolve) => {
++    const stop = () => {
++      bot.stop("SIGINT");
++      resolve();
++    };
++    process.once("SIGINT", stop);
++    process.once("SIGTERM", stop);
++  });
++}
+diff --git a/modes/telegram/text.ts b/modes/telegram/text.ts
+index 5a12236..9869f9f 100644
+--- a/modes/telegram/text.ts
++++ b/modes/telegram/text.ts
+@@ -1,8 +1,26 @@
+ export const clip = (text: string, max = 4000) =>
+   text.length <= max ? text : text.slice(0, max) + '\n…[truncated]';
+ 
+-export const replyMd = (ctx: { reply: (t: string, o?: object) => Promise<unknown> }, text: string) =>
+-  ctx.reply(clip(text), { parse_mode: 'Markdown' });
++export async function replyMd(
++  ctx: { reply: (t: string, o?: object) => Promise<unknown> },
++  text: string,
++) {
++  const body = clip(text);
++  try {
++    await ctx.reply(body, { parse_mode: 'Markdown' });
++  } catch {
++    // Model output often has unbalanced * or _ that Telegram rejects.
++    await ctx.reply(body);
++  }
++}
++
++export async function reportError(
++  ctx: { reply: (t: string) => Promise<unknown> },
++  err: unknown,
++) {
++  console.error(err);
++  await ctx.reply('⚠️ Something went wrong while running that. Check the server logs.').catch(() => {});
++}
+ 
+ /** Text after `/name …` */
+ export function commandArg(fullText: string, name: string): string {
+diff --git a/package.json b/package.json
+index 93980b1..b5928ec 100644
+--- a/package.json
++++ b/package.json
+@@ -7,7 +7,8 @@
+     "FierceClaw": "./index.ts"
+   },
+   "scripts": {
+-    "typecheck": "bun check"
++    "typecheck": "tsc --noEmit",
++    "test": "bun test"
+   },
+   "devDependencies": {
+     "@types/bun": "^1.4.2"
+@@ -29,6 +30,7 @@
+     "figlet": "^1.12.0",
+     "marked": "^18.1.1",
+     "marked-terminal": "^7.3.0",
++    "zod": "^4.0.0",
+     "telegraf": "^4.16.3"
+   }
+ }
+diff --git a/tests/tool-executor.test.ts b/tests/tool-executor.test.ts
+new file mode 100644
+index 0000000..6bb5b22
+--- /dev/null
++++ b/tests/tool-executor.test.ts
+@@ -0,0 +1,70 @@
++import { describe, expect, test, beforeEach, afterEach } from "bun:test";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { ToolExecutor } from "../modes/agent/tool-executor";
++import { ActionTracker } from "../modes/agent/action-tracker";
++import { defaultAgentConfig } from "../modes/agent/types";
++
++let dir: string;
++let tracker: ActionTracker;
++let exec: ToolExecutor;
++
++beforeEach(() => {
++  dir = fs.mkdtempSync(path.join(os.tmpdir(), "claw-"));
++  fs.writeFileSync(path.join(dir, "a.txt"), "hello");
++  fs.writeFileSync(path.join(dir, ".env"), "SECRET=1");
++  const config = { ...defaultAgentConfig(), codebasePath: dir };
++  tracker = new ActionTracker();
++  exec = new ToolExecutor(tracker, config);
++});
++
++afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
++
++describe("workspace safety", () => {
++  test("blocks path traversal", () => {
++    expect(() => exec.readFile("../../etc/passwd")).toThrow(/escapes workspace|excluded/);
++  });
++  test("blocks reading .env", () => {
++    expect(() => exec.readFile(".env")).toThrow(/excluded/);
++  });
++});
++
++describe("staging", () => {
++  test("createFile stages without writing to disk", () => {
++    exec.createFile("new.txt", "x");
++    expect(fs.existsSync(path.join(dir, "new.txt"))).toBe(false);
++    expect(tracker.pendingMutations()).toHaveLength(1);
++  });
++  test("nothing is written unless approved", () => {
++    exec.createFile("new.txt", "x");
++    exec.applyApprovedFromTracker();
++    expect(fs.existsSync(path.join(dir, "new.txt"))).toBe(false);
++  });
++  test("approved create is written", () => {
++    exec.createFile("new.txt", "x");
++    for (const a of tracker.pendingMutations()) tracker.updateStatus(a.id, "approved", true);
++    const { errors } = exec.applyApprovedFromTracker();
++    expect(errors).toHaveLength(0);
++    expect(fs.readFileSync(path.join(dir, "new.txt"), "utf8")).toBe("x");
++  });
++  test("refuses to create a file that already exists", () => {
++    expect(() => exec.createFile("a.txt", "x")).toThrow(/already exists/);
++  });
++});
++
++describe("symlinks", () => {
++  test("a symlink cannot expose files outside the workspace", () => {
++    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "outside-"));
++    fs.writeFileSync(path.join(outside, "secret.txt"), "TOP-SECRET");
++    fs.symlinkSync(outside, path.join(dir, "link"));
++    expect(() => exec.readFile("link/secret.txt")).toThrow(/escapes workspace/);
++    fs.rmSync(outside, { recursive: true, force: true });
++  });
++  test("a symlink cannot be used to write outside the workspace", () => {
++    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "outside-"));
++    fs.symlinkSync(outside, path.join(dir, "link"));
++    expect(() => exec.createFile("link/evil.txt", "x")).toThrow(/escapes workspace/);
++    fs.rmSync(outside, { recursive: true, force: true });
++  });
++});
+diff --git a/tsconfig.json b/tsconfig.json
+index e26abde..c5668ee 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -7,7 +7,7 @@
+     "moduleDetection": "force",
+     "jsx": "react-jsx",
+     "allowJs": true,
+-    "types": ["node"],
++    "types": ["node", "bun"],
+ 
+     // Bundler mode
+     "moduleResolution": "bundler",
+diff --git a/tui/wakeup.ts b/tui/wakeup.ts
+index 7fdcb93..1f778ed 100644
+--- a/tui/wakeup.ts
++++ b/tui/wakeup.ts
+@@ -45,7 +45,7 @@ export async function runWakeup() {
+         ]
+     })
+ 
+-    if(isCancel(mode || mode === "exit")){
++    if(isCancel(mode) || mode === "exit"){
+         console.log(chalk.dim("\n GOODBYE. \n"));
+         return;
+     }

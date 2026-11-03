@@ -1,7 +1,7 @@
 import type { Telegraf } from "telegraf";
 import { isOwner } from "./auth";
 import { WELCOME } from "./constants";
-import { clip, commandArg } from "./text";
+import { clip, commandArg, reportError } from "./text";
 import { runAgent, runAsk, runPlanSteps } from "./agent-run";
 import { generatePlan } from "../plan/planner";
 import { planKeyboard, planMessage, planSessions, refreshPlanUi, type PlanSession } from "./plan-session";
@@ -22,7 +22,7 @@ export function registerHandlers(bot: Telegraf) {
       });
 
     await ctx.reply("🔍 Researching your question…");
-    void runAsk(ctx, q).catch(console.error);
+    void runAsk(ctx, q).catch((e) => reportError(ctx, e));
   });
 
   bot.command("agent", async (ctx) => {
@@ -33,7 +33,7 @@ export function registerHandlers(bot: Telegraf) {
         parse_mode: "Markdown",
       });
     await ctx.reply("🤖 Agent is working on your task…");
-    void runAgent(ctx, ctx.chat.id, goal).catch(console.error);
+    void runAgent(ctx, ctx.chat.id, goal).catch((e) => reportError(ctx, e));
   });
 
   bot.command("plan", async (ctx) => {
@@ -52,7 +52,7 @@ export function registerHandlers(bot: Telegraf) {
         const session:PlanSession = {plan , selected:new Set(plan.steps.map((s)=>s.id))}
         await ctx.reply(planMessage(session) , {parse_mode:"Markdown", ...planKeyboard(session)});
          planSessions.set(ctx.chat.id, session);
-    })().catch(console.error)
+    })().catch((e) => reportError(ctx, e))
   });
 
     bot.action(/^plan_toggle:(.+)$/, async (ctx) => {
@@ -101,7 +101,7 @@ export function registerHandlers(bot: Telegraf) {
     await ctx.editMessageText(`🚀 Executing ${steps.length} step(s)…\n\n${list}`);
     await ctx.answerCbQuery();
 
-    void runPlanSteps(ctx, ctx.chat!.id, plan, steps).catch(console.error);
+    void runPlanSteps(ctx, ctx.chat!.id, plan, steps).catch((e) => reportError(ctx, e));
   });
 
   bot.action('approval_diff', async (ctx) => {
@@ -122,9 +122,15 @@ export function registerHandlers(bot: Telegraf) {
     const { errors } = s.executor.applyApprovedFromTracker();
     s.executor.clearStaging();
 
-    await ctx.editMessageText('✅ All changes applied.');
-    await ctx.answerCbQuery('Applied!');
-    if (errors.length) console.error(errors);
+    if (errors.length) {
+      console.error(errors);
+      await ctx.editMessageText(
+        clip(`⚠️ Applied with ${errors.length} error(s):\n` + errors.join('\n')),
+      );
+    } else {
+      await ctx.editMessageText('✅ All changes applied.');
+    }
+    await ctx.answerCbQuery(errors.length ? 'Finished with errors' : 'Applied!');
   });
 
   bot.action('approval_reject', async (ctx) => {
